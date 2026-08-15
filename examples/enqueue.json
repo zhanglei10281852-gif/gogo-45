@@ -1,0 +1,18 @@
+{
+  "id": "render-invoice-1001",
+  "queue": "documents",
+  "type": "render_invoice",
+  "payload": { "invoice_id": 1001 },
+  "priority": 25,
+  "delay_seconds": 0,
+  "max_attempts": 5,
+  "backoff": {
+    "kind": "exponential",
+    "base_seconds": 10,
+    "max_seconds": 900,
+    "jitter_percent": 15
+  },
+  "required_labels": { "renderer": "pdf" },
+  "resources": { "cpu": 2, "memory_mb": 512, "slots": 1 },
+  "idempotency_key": "invoice-1001-v1"
+}

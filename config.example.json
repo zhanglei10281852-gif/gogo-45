@@ -1,0 +1,13 @@
+{
+  "data_dir": ".queueforge",
+  "lease_seconds": 60,
+  "heartbeat_grace_seconds": 15,
+  "snapshot_every": 100,
+  "max_journal_bytes": 67108864,
+  "default_max_attempts": 3,
+  "default_backoff_seconds": 5,
+  "default_backoff_max_seconds": 3600,
+  "default_queues": ["default"],
+  "clock_skew_tolerance_seconds": 5,
+  "idempotency_retention_hours": 168
+}

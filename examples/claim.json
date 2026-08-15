@@ -1,0 +1,10 @@
+{
+  "worker": {
+    "id": "worker-local-1",
+    "queues": ["documents"],
+    "labels": { "renderer": "pdf" },
+    "capacity": { "cpu": 8, "memory_mb": 4096, "slots": 4 }
+  },
+  "limit": 4,
+  "lease_seconds": 90
+}

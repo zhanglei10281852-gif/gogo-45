@@ -1,0 +1,6 @@
+/queueforge
+/queueforge.exe
+*.tmp
+*.lock
+.coverage
+.cache/
