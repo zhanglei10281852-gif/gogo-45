@@ -43,9 +43,16 @@ type Plan struct {
 	CriticalPath      []string         `json:"critical_path"`
 }
 
-type workerSlot struct {
-	worker model.Worker
-	freeAt time.Time
+type reservation struct {
+	jobID     string
+	startAt   time.Time
+	finishAt  time.Time
+	resources model.Resources
+}
+
+type workerSchedule struct {
+	worker       model.Worker
+	reservations []reservation
 }
 
 func Build(jobs []*model.Job, request PlanRequest) (Plan, error) {
@@ -72,7 +79,7 @@ func Build(jobs []*model.Job, request PlanRequest) (Plan, error) {
 		}
 		durations[estimate.JobType] = time.Duration(estimate.Seconds) * time.Second
 	}
-	slots := make([]workerSlot, 0)
+	schedules := make([]workerSchedule, 0, len(request.Workers))
 	workerIDs := make(map[string]bool)
 	for _, worker := range request.Workers {
 		if err := worker.Validate(); err != nil {
@@ -82,9 +89,7 @@ func Build(jobs []*model.Job, request PlanRequest) (Plan, error) {
 			return Plan{}, fmt.Errorf("duplicate worker %s", worker.ID)
 		}
 		workerIDs[worker.ID] = true
-		for i := 0; i < worker.Capacity.Slots; i++ {
-			slots = append(slots, workerSlot{worker: worker, freeAt: request.StartAt})
-		}
+		schedules = append(schedules, workerSchedule{worker: worker})
 	}
 	byID := make(map[string]*model.Job, len(jobs))
 	for _, job := range jobs {
@@ -118,7 +123,7 @@ func Build(jobs []*model.Job, request PlanRequest) (Plan, error) {
 				progress = true
 				continue
 			}
-			index, start, reason := chooseSlot(slots, job, request.StartAt, finishTimes)
+			index, start, reason := chooseWorker(schedules, job, request.StartAt, finishTimes, duration)
 			if index < 0 {
 				plan.Unscheduled = append(plan.Unscheduled, Unscheduled{JobID: job.ID, Reason: reason})
 				delete(remaining, job.ID)
@@ -132,10 +137,10 @@ func Build(jobs []*model.Job, request PlanRequest) (Plan, error) {
 				progress = true
 				continue
 			}
-			assignment := Assignment{JobID: job.ID, WorkerID: slots[index].worker.ID, StartAt: start, FinishAt: finish, Priority: job.Priority}
+			assignment := Assignment{JobID: job.ID, WorkerID: schedules[index].worker.ID, StartAt: start, FinishAt: finish, Priority: job.Priority}
 			plan.Assignments = append(plan.Assignments, assignment)
 			plan.WorkerBusySeconds[assignment.WorkerID] += int64(duration.Seconds())
-			slots[index].freeAt = finish
+			schedules[index].reservations = append(schedules[index].reservations, reservation{jobID: job.ID, startAt: start, finishAt: finish, resources: job.Resources})
 			finishTimes[job.ID] = finish
 			if finish.After(plan.EndAt) {
 				plan.EndAt = finish
@@ -184,7 +189,7 @@ func readyJobs(remaining, all map[string]*model.Job, finish map[string]time.Time
 	return result
 }
 
-func chooseSlot(slots []workerSlot, job *model.Job, planStart time.Time, finish map[string]time.Time) (int, time.Time, string) {
+func chooseWorker(schedules []workerSchedule, job *model.Job, planStart time.Time, finish map[string]time.Time, duration time.Duration) (int, time.Time, string) {
 	dependencyReady := planStart
 	for _, dependency := range job.Dependencies {
 		if value := finish[dependency]; value.After(dependencyReady) {
@@ -198,37 +203,18 @@ func chooseSlot(slots []workerSlot, job *model.Job, planStart time.Time, finish 
 	var bestStart time.Time
 	capacitySeen := false
 	routeSeen := false
-	for index, slot := range slots {
-		if !job.Resources.Fits(slot.worker.Capacity) {
+	for index := range schedules {
+		schedule := &schedules[index]
+		if !job.Resources.Fits(schedule.worker.Capacity) {
 			continue
 		}
 		capacitySeen = true
-		queueOK := false
-		for _, queue := range slot.worker.Queues {
-			if queue == "*" || queue == job.Queue {
-				queueOK = true
-				break
-			}
-		}
-		if !queueOK {
-			continue
-		}
-		labelsOK := true
-		for key, value := range job.RequiredLabels {
-			if slot.worker.Labels[key] != value {
-				labelsOK = false
-				break
-			}
-		}
-		if !labelsOK {
+		if !workerRoutes(schedule.worker, job) {
 			continue
 		}
 		routeSeen = true
-		start := dependencyReady
-		if slot.freeAt.After(start) {
-			start = slot.freeAt
-		}
-		if best < 0 || start.Before(bestStart) || (start.Equal(bestStart) && slot.worker.ID < slots[best].worker.ID) {
+		start := earliestFeasibleStart(schedule, job.Resources, dependencyReady, duration)
+		if best < 0 || start.Before(bestStart) || (start.Equal(bestStart) && schedule.worker.ID < schedules[best].worker.ID) {
 			best, bestStart = index, start
 		}
 	}
@@ -241,7 +227,80 @@ func chooseSlot(slots []workerSlot, job *model.Job, planStart time.Time, finish 
 	if !routeSeen {
 		return -1, time.Time{}, "no worker matches queue and labels"
 	}
-	return -1, time.Time{}, "no eligible worker slot"
+	return -1, time.Time{}, "no eligible worker"
+}
+
+func workerRoutes(worker model.Worker, job *model.Job) bool {
+	queueOK := false
+	for _, queue := range worker.Queues {
+		if queue == "*" || queue == job.Queue {
+			queueOK = true
+			break
+		}
+	}
+	if !queueOK {
+		return false
+	}
+	for key, value := range job.RequiredLabels {
+		if worker.Labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func earliestFeasibleStart(schedule *workerSchedule, resources model.Resources, notBefore time.Time, duration time.Duration) time.Time {
+	candidates := []time.Time{notBefore}
+	for _, existing := range schedule.reservations {
+		if existing.finishAt.After(notBefore) {
+			candidates = append(candidates, existing.finishAt)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Before(candidates[j]) })
+	var previous time.Time
+	for _, start := range candidates {
+		if !previous.IsZero() && start.Equal(previous) {
+			continue
+		}
+		previous = start
+		if intervalFits(schedule.reservations, resources, schedule.worker.Capacity, start, start.Add(duration)) {
+			return start
+		}
+	}
+	panic("no feasible start after all reservations")
+}
+
+func intervalFits(reservations []reservation, requested, capacity model.Resources, start, finish time.Time) bool {
+	boundaries := []time.Time{start, finish}
+	for _, existing := range reservations {
+		if !existing.startAt.Before(finish) || !start.Before(existing.finishAt) {
+			continue
+		}
+		if existing.startAt.After(start) && existing.startAt.Before(finish) {
+			boundaries = append(boundaries, existing.startAt)
+		}
+		if existing.finishAt.After(start) && existing.finishAt.Before(finish) {
+			boundaries = append(boundaries, existing.finishAt)
+		}
+	}
+	sort.Slice(boundaries, func(i, j int) bool { return boundaries[i].Before(boundaries[j]) })
+	for index := 0; index+1 < len(boundaries); index++ {
+		at, next := boundaries[index], boundaries[index+1]
+		if !at.Before(next) {
+			continue
+		}
+		used := model.Resources{}
+		for _, existing := range reservations {
+			if !existing.startAt.After(at) && at.Before(existing.finishAt) {
+				used = used.Add(existing.resources)
+			}
+		}
+		remaining := capacity.Sub(used)
+		if !requested.Fits(remaining) {
+			return false
+		}
+	}
+	return true
 }
 
 func criticalPath(jobs map[string]*model.Job, durations map[string]time.Duration) []string {
